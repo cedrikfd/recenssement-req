@@ -72,8 +72,10 @@ Then add the repository secrets used by the scheduled workflow
 | `CLOUDFLARE_API_TOKEN` | *Account → D1 → Edit* and *Account → Workers Scripts → Edit* |
 | `CLOUDFLARE_ACCOUNT_ID` | Your account id (Workers dashboard, right sidebar) |
 
-Push the repository and enable the **Ingest Excel feed** workflow. It runs every 5 minutes and
-can also be started manually with *Run workflow*.
+Push the repository and enable the **Ingest Excel feed** workflow. It runs every 5 minutes, two
+minutes after each publisher tick (`2-57/5 * * * *`), and can also be started manually with
+*Run workflow* — do that once right after the first push, because GitHub can take a while to
+register a new schedule (see *Cadence and quotas → The scheduler is best-effort*).
 
 
 ## Data model
@@ -233,15 +235,13 @@ A run costs ~30 written rows: ~9 upserts into `stations_current`, ~9 inserts int
 `.github/workflows/ingest.yml`) only prunes the history — `stations_current` always keeps the last
 known price of every station, even if it has not moved in months.
 
-### The real limit at this cadence is Actions minutes, not D1
+### Actions minutes
 
-The repository is private, so each run is billed. 288 runs/day at ~20 s ≈ 96 min/day ≈
-**2,900 min/month**, against 2,000 included with GitHub Free (3,000 with Pro). Options:
-
-- make the repository **public** — scheduled workflows then do not consume minutes, and the data is
-  public anyway (recommended);
-- keep it private and accept a small overage, or upgrade to Pro;
-- slow the cron down (e.g. `*/15 * * * *` ≈ 960 min/month) if 15-minute resolution is enough.
+On a **public** repository scheduled runs do not consume Actions minutes, so 288 runs/day
+(~96 min/day of runner time) cost nothing. It only matters if this is forked into a **private**
+repository: 288 runs/day at ~20 s ≈ **2,900 min/month**, against 2,000 included with GitHub Free
+(3,000 with Pro). In that case, upgrade or slow the cron down (e.g. `*/15 * * * *` ≈ 960 min/month)
+if 15-minute resolution is enough.
 
 The workflow already keeps scheduled runs as short as possible: unit tests run on pushes and manual
 runs only (`if: github.event_name != 'schedule'`), and dependencies are installed from the committed
@@ -250,9 +250,22 @@ runs only (`if: github.event_name != 'schedule'`), and dependencies are installe
 Unchanged files are skipped: the `file_url` is checked against `ingest_runs` before anything is
 downloaded, so a manual re-run of the workflow costs nothing.
 
-GitHub's scheduler can delay runs by a few minutes and disables scheduled workflows after 60 days
-without repository activity — the run always ingests *the newest file at that moment*, so a late run
-simply picks a newer file. Cron expressions are UTC, so the schedule does not shift with daylight
+### The scheduler is best-effort
+
+GitHub's scheduler is not a real-time clock: runs can be delayed by several minutes, are slower
+right after the top of the hour (that is why the cron is offset to `:02`), and **a newly added
+`*/5` schedule can take a surprisingly long time to start at all** — the first scheduled run may be
+tens of minutes late even though the workflow shows `state: active` and the file is valid. If no
+scheduled run appears:
+
+1. start one manually (*Run workflow*) to prove the pipeline itself works;
+2. check the cadence with `curl -s …/health` — `last_ingest_at` must advance every 5 minutes;
+3. re-register the schedule by opening *Actions → Ingest Excel feed → ⋯ → Disable workflow*, then
+   *Enable workflow* (or push any commit touching `ingest.yml`).
+
+Scheduled workflows are also disabled after 60 days without repository activity. A late run is
+harmless: the run always ingests *the newest file at that moment*, and the `ingest_runs` check skips
+files that were already stored. Cron expressions are UTC, so the schedule does not follow daylight
 saving time.
 
 ## Local development

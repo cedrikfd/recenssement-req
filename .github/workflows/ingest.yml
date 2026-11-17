@@ -9,7 +9,13 @@ name: Ingest Excel feed
 # See README.md -> "Cadence and quotas" before changing the schedule.
 on:
   schedule:
-    - cron: '*/5 * * * *'
+    # Offset from the publisher's tick. GitHub delays scheduled runs during high
+    # load — "including at the start of every hour" — and a plain `*/5` lands
+    # exactly on :00, the busiest minute. :02/:07/… still means every 5 minutes,
+    # plus it gives the publisher two minutes to publish the :00 file. The offset
+    # only moves our clock: the ingester reads the newest file from
+    # stations.geojson.gz metadata, so it never guesses a file name.
+    - cron: '2-57/5 * * * *'
   workflow_dispatch:
 
 permissions:
