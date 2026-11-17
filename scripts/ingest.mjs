@@ -5,10 +5,16 @@
  *   1. Reads https://regieessencequebec.ca/stations.geojson.gz metadata
  *      (the public map data) to find the newest Excel file.
  *   2. Downloads and parses that .xlsx file.
- *   3. Generates idempotent SQL and applies it to D1 through Wrangler.
+ *   3. Compares it with `stations_current` and keeps only the stations whose
+ *      price (or address) actually moved.
+ *   4. Generates idempotent SQL and applies it to D1 through Wrangler.
  *
- * Every inserted row carries the file timestamp (from the Excel file name)
- * and the execution timestamp of this job.
+ * The source publishes a file every 5 minutes, so writing every file as a full
+ * snapshot is not affordable on the D1 free tier. Instead each run appends the
+ * changed stations to `price_changes` (history) and upserts them into
+ * `stations_current` (latest values) — typically ~10 rows instead of ~2,470.
+ * Every written row carries the file timestamp from the Excel file name and
+ * the execution timestamp of this job.
  *
  * Usage:
  *   node scripts/ingest.mjs            # ingest into remote D1
@@ -17,6 +23,7 @@
  */
 
 import { execFile } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -31,25 +38,43 @@ const ROOT = fileURLToPath(new URL('../', import.meta.url));
 export const SITE_URL = (process.env.SITE_URL ?? 'https://regieessencequebec.ca').replace(/\/+$/, '');
 export const USER_AGENT = 'regie-essence-ingest/1.0';
 
-const COLUMNS = [
-  'file_url',
-  'file_timestamp',
-  'executed_at',
+/**
+ * Fields compared between the new file and `stations_current`, mapped to their
+ * D1 columns. Prices are compared as numbers (the raw "179.4¢" text is stored
+ * but ignored for change detection, so a formatting change is not a change).
+ */
+const COMPARED_FIELDS = {
+  name: 'name',
+  brand: 'brand',
+  address: 'address',
+  region: 'region',
+  postalCode: 'postal_code',
+  latitude: 'latitude',
+  longitude: 'longitude',
+  regularPriceCents: 'regular_price_cents',
+  superPriceCents: 'super_price_cents',
+  dieselPriceCents: 'diesel_price_cents',
+};
+
+const PRICE_FIELDS = ['regularPriceCents', 'superPriceCents', 'dieselPriceCents'];
+const LOCATION_FIELDS = ['name', 'brand', 'address', 'region', 'postalCode', 'latitude', 'longitude'];
+
+/** Columns shared by price_changes and stations_current, in schema order. */
+const STATION_COLUMNS = [
+  'station_key',
   'row_number',
-  'name',
-  'brand',
-  'address',
-  'region',
-  'postal_code',
-  'latitude',
-  'longitude',
-  'regular_price_cents',
-  'super_price_cents',
-  'diesel_price_cents',
+  ...Object.values(COMPARED_FIELDS),
   'regular_price_raw',
   'super_price_raw',
   'diesel_price_raw',
 ];
+
+const CHANGE_COLUMNS = [...STATION_COLUMNS, 'file_url', 'file_timestamp', 'executed_at'];
+
+const CURRENT_COLUMNS = [...CHANGE_COLUMNS, 'first_seen_at'];
+
+/** The subset of stations_current read back to detect changes. */
+const COMPARE_COLUMNS = ['station_key', ...Object.values(COMPARED_FIELDS)];
 
 const HEADER_ALIASES = {
   name: ['nom', 'name', 'station', 'nomstation'],
@@ -63,6 +88,13 @@ const HEADER_ALIASES = {
   super: ['prixsuper', 'super'],
   diesel: ['prixdiesel', 'diesel'],
 };
+
+/**
+ * Footer lines repeated under the last station. They used to be ingested as
+ * stations, and the "Données générées le …" line carries the file timestamp,
+ * so it looked like a brand new station in every single file.
+ */
+const FOOTER_PATTERN = /^(total\s+de\s+stations\b|donn[ée]es\s+g[ée]n[ée]r[ée]es\b|source\s*:)/i;
 
 const FALLBACK_ORDER = [
   'name',
@@ -252,8 +284,26 @@ export function parseWorkbook(buffer) {
       skippedRows++;
       continue;
     }
-    // Footer row, e.g. "Total de stations : 2470"
-    if (/^total\s+de\s+stations\b/i.test(name)) {
+
+    const address = cleanText(row[map.address]);
+    const postalCode = cleanText(row[map.postalCode]);
+    const regularPriceCents = parsePriceCents(row[map.regular]);
+    const superPriceCents = parsePriceCents(row[map.super]);
+    const dieselPriceCents = parsePriceCents(row[map.diesel]);
+
+    // Footer/metadata lines ("Total de stations : 2470", "Données générées
+    // le : …", "Source : …") carry no station data.
+    if (FOOTER_PATTERN.test(name)) {
+      skippedRows++;
+      continue;
+    }
+    if (
+      !address &&
+      !postalCode &&
+      regularPriceCents === null &&
+      superPriceCents === null &&
+      dieselPriceCents === null
+    ) {
       skippedRows++;
       continue;
     }
@@ -264,14 +314,14 @@ export function parseWorkbook(buffer) {
       rowNumber: index + 1,
       name,
       brand: cleanText(row[map.brand]),
-      address: cleanText(row[map.address]),
+      address,
       region: cleanText(row[map.region]),
-      postalCode: cleanText(row[map.postalCode]),
+      postalCode,
       latitude: toNumber(row[map.latitude]),
       longitude: toNumber(row[map.longitude]),
-      regularPriceCents: parsePriceCents(row[map.regular]),
-      superPriceCents: parsePriceCents(row[map.super]),
-      dieselPriceCents: parsePriceCents(row[map.diesel]),
+      regularPriceCents,
+      superPriceCents,
+      dieselPriceCents,
       regularPriceRaw: priceRaw('regular'),
       superPriceRaw: priceRaw('super'),
       dieselPriceRaw: priceRaw('diesel'),
@@ -279,6 +329,90 @@ export function parseWorkbook(buffer) {
   }
 
   return { rows, sheetName, headerIndex, skippedRows };
+}
+
+/* ------------------------------------------------------------------ */
+/* Change detection                                                    */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Stable identity of a station across files. The source workbook has no
+ * station id and rows are re-sorted, so the key is a hash of the normalized
+ * name + address: accents, case, punctuation and spacing are irrelevant
+ * ("Dépanneur  O'Neil" and "depanneur o neil" hash the same).
+ */
+export function stationKey(row) {
+  const text = `${row.name ?? ''}|${row.address ?? ''}`
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9|]+/g, '')
+    .replace(/\|+/g, '|');
+  return createHash('sha256').update(text).digest('hex').slice(0, 16);
+}
+
+function sameValue(next, previous) {
+  const nextEmpty = next === null || next === undefined;
+  const previousEmpty = previous === null || previous === undefined;
+  if (nextEmpty || previousEmpty) return nextEmpty && previousEmpty;
+  return next === previous;
+}
+
+/**
+ * Compare a freshly parsed file with the current state of the database and
+ * return only the rows that must be written.
+ *
+ * A row is kept when the station is new, when any price moved, or when a
+ * location field changed. Everything else is left untouched in D1.
+ *
+ * Stations that disappeared from the file are returned in `removed`: they are
+ * deleted from `stations_current` (their history in `price_changes` stays), so
+ * `GET /latest` keeps mirroring the newest file. Because the key is derived
+ * from name + address, a corrected address shows up as one removal plus one
+ * addition — which is also the right outcome: no duplicate, no orphan.
+ */
+export function planIngest(rows, currentRows = []) {
+  const current = new Map();
+  for (const row of currentRows) {
+    const key = row.station_key ?? row.stationKey;
+    if (key) current.set(key, row);
+  }
+
+  const changed = [];
+  const stats = { added: 0, priceChanged: 0, locationChanged: 0, unchanged: 0, removed: 0, duplicates: 0 };
+  const seen = new Set();
+
+  for (const row of rows) {
+    const key = stationKey(row);
+    if (seen.has(key)) stats.duplicates++;
+    seen.add(key);
+
+    const previous = current.get(key);
+    if (!previous) {
+      stats.added++;
+      changed.push({ ...row, stationKey: key });
+      continue;
+    }
+
+    const priceChanged = PRICE_FIELDS.some((field) => !sameValue(row[field], previous[COMPARED_FIELDS[field]]));
+    const locationChanged = LOCATION_FIELDS.some(
+      (field) => !sameValue(row[field], previous[COMPARED_FIELDS[field]]),
+    );
+
+    if (priceChanged) stats.priceChanged++;
+    else if (locationChanged) stats.locationChanged++;
+    else {
+      stats.unchanged++;
+      continue;
+    }
+
+    changed.push({ ...row, stationKey: key });
+  }
+
+  const removed = [...current.keys()].filter((key) => !seen.has(key));
+  stats.removed = removed.length;
+
+  return { changed, removed, stats };
 }
 
 /* ------------------------------------------------------------------ */
@@ -294,60 +428,119 @@ export function sqlNumber(value) {
   return typeof value === 'number' && Number.isFinite(value) ? String(value) : 'NULL';
 }
 
-export function buildInsertStatements(rows, { fileUrl, fileTimestamp, executedAt, rowsPerStatement = 100 }) {
-  const statements = [];
-  for (let start = 0; start < rows.length; start += rowsPerStatement) {
-    const chunk = rows.slice(start, start + rowsPerStatement);
-    const values = chunk
-      .map(
-        (row) =>
-          `(${[
-            sqlString(fileUrl),
-            sqlString(fileTimestamp),
-            sqlString(executedAt),
-            sqlNumber(row.rowNumber),
-            sqlString(row.name),
-            sqlString(row.brand),
-            sqlString(row.address),
-            sqlString(row.region),
-            sqlString(row.postalCode),
-            sqlNumber(row.latitude),
-            sqlNumber(row.longitude),
-            sqlNumber(row.regularPriceCents),
-            sqlNumber(row.superPriceCents),
-            sqlNumber(row.dieselPriceCents),
-            sqlString(row.regularPriceRaw),
-            sqlString(row.superPriceRaw),
-            sqlString(row.dieselPriceRaw),
-          ].join(', ')})`,
-      )
-      .join(',\n  ');
-    statements.push(`INSERT OR IGNORE INTO station_prices (${COLUMNS.join(', ')}) VALUES\n  ${values};`);
+const ROW_EXPRESSION = {
+  station_key: (row) => sqlString(row.stationKey),
+  row_number: (row) => sqlNumber(row.rowNumber),
+  name: (row) => sqlString(row.name),
+  brand: (row) => sqlString(row.brand),
+  address: (row) => sqlString(row.address),
+  region: (row) => sqlString(row.region),
+  postal_code: (row) => sqlString(row.postalCode),
+  latitude: (row) => sqlNumber(row.latitude),
+  longitude: (row) => sqlNumber(row.longitude),
+  regular_price_cents: (row) => sqlNumber(row.regularPriceCents),
+  super_price_cents: (row) => sqlNumber(row.superPriceCents),
+  diesel_price_cents: (row) => sqlNumber(row.dieselPriceCents),
+  regular_price_raw: (row) => sqlString(row.regularPriceRaw),
+  super_price_raw: (row) => sqlString(row.superPriceRaw),
+  diesel_price_raw: (row) => sqlString(row.dieselPriceRaw),
+};
+
+function columnExpression(column, row, { fileUrl, fileTimestamp, executedAt }) {
+  switch (column) {
+    case 'file_url':
+      return sqlString(fileUrl);
+    case 'file_timestamp':
+      return sqlString(fileTimestamp);
+    case 'executed_at':
+    case 'first_seen_at':
+      return sqlString(executedAt);
+    default: {
+      const expression = ROW_EXPRESSION[column];
+      if (!expression) throw new Error(`Unknown column: ${column}`);
+      return expression(row);
+    }
   }
-  return statements;
+}
+
+function chunk(rows, size) {
+  const chunks = [];
+  for (let start = 0; start < rows.length; start += size) chunks.push(rows.slice(start, start + size));
+  return chunks;
+}
+
+function valuesSql(columns, rows, meta) {
+  return rows
+    .map((row) => `  (${columns.map((column) => columnExpression(column, row, meta)).join(', ')})`)
+    .join(',\n');
+}
+
+/** History: one row per changed station, per file timestamp. */
+export function buildChangeInserts(changed, meta, rowsPerStatement = 100) {
+  return chunk(changed, rowsPerStatement).map(
+    (rows) =>
+      `INSERT OR IGNORE INTO price_changes (${CHANGE_COLUMNS.join(', ')})\nVALUES\n${valuesSql(CHANGE_COLUMNS, rows, meta)};`,
+  );
+}
+
+/** Latest values: upsert, preserving the original first_seen_at. */
+export function buildCurrentUpserts(changed, meta, rowsPerStatement = 100) {
+  const updates = CURRENT_COLUMNS.filter((column) => column !== 'station_key' && column !== 'first_seen_at')
+    .map((column) => `${column} = excluded.${column}`)
+    .join(', ');
+
+  return chunk(changed, rowsPerStatement).map(
+    (rows) =>
+      `INSERT INTO stations_current (${CURRENT_COLUMNS.join(', ')})\nVALUES\n${valuesSql(CURRENT_COLUMNS, rows, meta)}\nON CONFLICT(station_key) DO UPDATE SET ${updates};`,
+  );
 }
 
 /**
- * Complete, idempotent SQL script for one snapshot.
- * Deleting by file_url first makes retries after a partial failure safe.
+ * Complete, idempotent SQL script for one file.
+ * `price_changes` is UNIQUE(station_key, file_timestamp) and `stations_current`
+ * is upserted, so retrying after a partial failure cannot duplicate anything.
+ * An unchanged file still records its ingest_runs row (that is what makes the
+ * "already ingested" check work) but writes no station rows at all.
  */
-export function buildSql({ rows, fileUrl, fileTimestamp, executedAt, retentionDays = 0, rowsPerStatement = 100 }) {
+export function buildSql({
+  changed,
+  removed = [],
+  rowCount = changed.length,
+  fileUrl,
+  fileTimestamp,
+  executedAt,
+  retentionDays = 0,
+  rowsPerStatement = 100,
+}) {
+  const meta = { fileUrl, fileTimestamp, executedAt };
   const statements = [];
+  const days = Math.trunc(retentionDays);
 
-  if (retentionDays > 0) {
+  if (days > 0) {
     statements.push(
-      `DELETE FROM station_prices WHERE file_timestamp < strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-${Math.trunc(retentionDays)} days');`,
+      `DELETE FROM price_changes WHERE file_timestamp < strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-${days} days');`,
+    );
+    statements.push(
+      `DELETE FROM ingest_runs WHERE file_timestamp < strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-${days} days');`,
     );
   }
 
-  statements.push(`DELETE FROM station_prices WHERE file_url = ${sqlString(fileUrl)};`);
-  statements.push(...buildInsertStatements(rows, { fileUrl, fileTimestamp, executedAt, rowsPerStatement }));
+  // Stations that vanished from the newest file (closed or renamed): drop the
+  // current row, keep the history.
+  for (const batch of chunk(removed, rowsPerStatement)) {
+    statements.push(
+      `DELETE FROM stations_current WHERE station_key IN (${batch.map((key) => sqlString(key)).join(', ')});`,
+    );
+  }
+
+  statements.push(...buildCurrentUpserts(changed, meta, rowsPerStatement));
+  statements.push(...buildChangeInserts(changed, meta, rowsPerStatement));
   statements.push(
     `INSERT OR REPLACE INTO ingest_runs (file_url, file_timestamp, executed_at, row_count, status, error) VALUES (${[
       sqlString(fileUrl),
       sqlString(fileTimestamp),
       sqlString(executedAt),
-      sqlNumber(rows.length),
+      sqlNumber(rowCount),
       sqlString('ok'),
       'NULL',
     ].join(', ')});`,
@@ -384,6 +577,11 @@ export async function d1Query(sql, { databaseName }) {
   const parsed = JSON.parse(start >= 0 ? stdout.slice(start) : stdout);
   const batches = Array.isArray(parsed) ? parsed : [parsed];
   return batches.flatMap((batch) => batch?.results ?? []);
+}
+
+/** Latest known values of every station, used for change detection. */
+export async function fetchCurrentStations({ databaseName }) {
+  return d1Query(`SELECT ${COMPARE_COLUMNS.join(', ')} FROM stations_current;`, { databaseName });
 }
 
 async function d1ApplyFile(sql, { databaseName }) {
@@ -441,8 +639,23 @@ async function main() {
   if (rows.length === 0) throw new Error('No station rows were parsed from the workbook');
   log(`Parsed ${rows.length} rows from "${sheetName}" (header row ${headerIndex + 1}, skipped ${skippedRows})`);
 
+  // Only the stations whose price moved are written to D1.
+  if (dryRun) log('DRY RUN: stations_current is not read, every parsed row is treated as changed');
+  const currentRows = dryRun ? [] : await fetchCurrentStations({ databaseName });
+  const plan = planIngest(rows, currentRows);
+  log(
+    `Change plan: ${plan.changed.length} row(s) to write, ${plan.stats.removed} to remove — ` +
+      `${plan.stats.added} new, ${plan.stats.priceChanged} price change(s), ` +
+      `${plan.stats.locationChanged} location change(s), ${plan.stats.unchanged} unchanged`,
+  );
+  if (plan.stats.duplicates > 0) {
+    log(`Warning: ${plan.stats.duplicates} duplicate station key(s) in the workbook (one row per key is kept)`);
+  }
+
   const sql = buildSql({
-    rows,
+    changed: plan.changed,
+    removed: plan.removed,
+    rowCount: rows.length,
     fileUrl: latest.excelUrl,
     fileTimestamp: latest.fileTimestamp,
     executedAt,
@@ -457,12 +670,13 @@ async function main() {
     const file = join(dir, `ingest-${latest.fileTimestamp.replace(/:/g, '')}.sql`);
     await writeFile(file, sql, 'utf8');
     log(`DRY RUN: SQL written to ${file}`);
-    log(JSON.stringify(rows.slice(0, 2), null, 2));
     return;
   }
 
   await d1ApplyFile(sql, { databaseName });
-  log(`Ingested ${rows.length} rows into D1 database "${databaseName}" at ${executedAt}`);
+  log(
+    `Wrote ${plan.changed.length} of ${rows.length} station rows into D1 database "${databaseName}" at ${executedAt}`,
+  );
 }
 
 const isMain = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
