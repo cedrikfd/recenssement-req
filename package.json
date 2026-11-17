@@ -1,0 +1,26 @@
+{
+  "name": "regie-essence-ingest",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Ingests the latest Régie de l'énergie (Québec) fuel-price Excel file into Cloudflare D1 and serves it through a Worker.",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "ingest": "node scripts/ingest.mjs",
+    "ingest:dry": "DRY_RUN=1 node scripts/ingest.mjs",
+    "test": "node --test test/",
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "db:create": "wrangler d1 create regie-essence",
+    "db:schema": "wrangler d1 execute regie-essence --remote --file=schema.sql",
+    "db:schema:local": "wrangler d1 execute regie-essence --local --file=schema.sql"
+  },
+  "dependencies": {
+    "xlsx": "https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz"
+  },
+  "devDependencies": {
+    "wrangler": "^4.163.0"
+  }
+}
