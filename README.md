@@ -147,16 +147,27 @@ npx wrangler d1 execute regie-essence --remote --command \
 
 ## How often should this run?
 
-The source publishes a **new file every 10 minutes**; each file contains ~2,471 rows.
+The source publishes a **new file every 5 minutes** (verified: `stations-20261117110000`,
+`…110500`, `…111000`, `…111500`, `…112000` and `…112500` all return 200, and the site's
+`metadata.excel_url` always points at the newest one); each file contains ~2,471 rows.
 The D1 free tier allows **100,000 rows written per day** (inserts *and* deletes) and
 **500 MB of storage per database**, so writing every file is not possible on the free plan:
 
 | Cron | Files/day | Rows written/day (insert + retention delete) | 14-day storage |
 | --- | --- | --- | --- |
-| every 10 min | 144 | ~711,000 | too much |
+| every 5 min (every source file) | 288 | ~1,420,000 ✗ | — |
+| every 10 min | 144 | ~711,000 ✗ | — |
+| every 15 min | 96 | ~474,000 ✗ | — |
+| every 30 min | 48 | ~237,000 ✗ | — |
 | hourly | 24 | ~118,600 ✗ over quota | ~200 MB |
 | **every 2 h (default)** | 12 | ~59,300 ✓ | ~100 MB |
 | every 3 h | 8 | ~39,500 ✓ | ~65 MB |
+
+Each run costs ~4,940 written rows (2,471 inserts + ~2,471 retention deletes), so the free
+tier caps you at ~20 runs/day. Going faster than every 2 hours therefore needs a different
+write strategy (insert only rows whose price changed) or the paid D1 plan. The repository is
+private, so runs also consume included Actions minutes: the default cadence uses ~25 s per
+run, ≈5 min/day or ~150 min/month.
 
 The workflow uses `0 */2 * * *` and `RETENTION_DAYS=14` (both in
 `.github/workflows/ingest.yml`). To change the cadence, edit the cron expression and the

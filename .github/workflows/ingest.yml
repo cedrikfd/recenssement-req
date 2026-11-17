@@ -1,6 +1,6 @@
 name: Ingest Excel feed
 
-# The source publishes a new Excel file every 10 minutes; we snapshot it
+# The source publishes a new Excel file every 5 minutes; we snapshot it
 # every 2 hours to stay inside the D1 free-tier write quota.
 # See README.md -> "How often should this run?" before changing the schedule.
 on:
