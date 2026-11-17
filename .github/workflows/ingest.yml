@@ -1,16 +1,22 @@
 name: Ingest Excel feed
 
-# The source publishes a new Excel file every 5 minutes; we snapshot it
-# every 2 hours to stay inside the D1 free-tier write quota.
-# See README.md -> "How often should this run?" before changing the schedule.
+# The source publishes a new Excel file every 5 minutes and this workflow
+# follows that cadence. Each run downloads only the newest file, compares it
+# with `stations_current` and writes just the stations whose price moved
+# (measured on consecutive real files: ~8 rows per 5 minutes). A run therefore
+# costs ~20 written rows instead of ~5,000, which keeps the D1 free tier
+# (100,000 written rows/day) comfortable.
+# See README.md -> "Cadence and quotas" before changing the schedule.
 on:
   schedule:
-    - cron: '0 */2 * * *'
+    - cron: '*/5 * * * *'
   workflow_dispatch:
 
 permissions:
   contents: read
 
+# Never let two ingests run at once: a queued run is better than two runs
+# racing on the same file.
 concurrency:
   group: regie-essence-ingest
   cancel-in-progress: false
@@ -18,22 +24,26 @@ concurrency:
 jobs:
   ingest:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-node@v4
         with:
           node-version: 24
+          cache: npm
 
-      # `npm install` (not `npm ci`) so the job also works before a
-      # package-lock.json is committed; it is honoured once it exists.
-      - run: npm install --no-audit --no-fund
+      - run: npm ci --no-audit --no-fund
 
-      - run: npm test
+      # Tests run on pushes and manual runs only. A scheduled run has to stay
+      # short: 288 runs/day are billed as Actions minutes on a private repo.
+      - name: Unit tests
+        if: github.event_name != 'schedule'
+        run: npm test
 
-      # schema.sql only contains CREATE ... IF NOT EXISTS statements, so this is
-      # safe on every run and repairs a database that was created but never seeded.
+      # schema.sql only contains CREATE ... IF NOT EXISTS (plus one DROP VIEW /
+      # CREATE VIEW), so it is safe on every run and repairs a database that
+      # was created but never seeded.
       - name: Apply the D1 schema (idempotent)
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}

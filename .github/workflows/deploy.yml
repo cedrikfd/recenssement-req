@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - 'worker/**'
+      - 'schema.sql'
       - 'wrangler.jsonc'
       - 'package-lock.json'
   workflow_dispatch:
@@ -22,10 +23,9 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 24
+          cache: npm
 
-      # `npm install` (not `npm ci`) so the job also works before a
-      # package-lock.json is committed; it is honoured once it exists.
-      - run: npm install --no-audit --no-fund
+      - run: npm ci --no-audit --no-fund
 
       - name: Deploy
         env:
