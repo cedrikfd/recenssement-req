@@ -32,6 +32,14 @@ jobs:
 
       - run: npm test
 
+      # schema.sql only contains CREATE ... IF NOT EXISTS statements, so this is
+      # safe on every run and repairs a database that was created but never seeded.
+      - name: Apply the D1 schema (idempotent)
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: npm run db:schema
+
       - name: Ingest the latest Excel file into D1
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}

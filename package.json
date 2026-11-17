@@ -10,7 +10,7 @@
   "scripts": {
     "ingest": "node scripts/ingest.mjs",
     "ingest:dry": "DRY_RUN=1 node scripts/ingest.mjs",
-    "test": "node --test test/",
+    "test": "node --test",
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
     "db:create": "wrangler d1 create regie-essence",

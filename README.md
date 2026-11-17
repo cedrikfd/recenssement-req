@@ -18,9 +18,10 @@ regieessencequebec.ca
                     ▼
       GitHub Actions (cron, every 2 hours)
       1. read the map metadata to find the newest Excel file
-      2. stop if that file_url is already in `ingest_runs`
-      3. download + parse the workbook (SheetJS)
-      4. build idempotent SQL and apply it with `wrangler d1 execute --file`
+      2. apply `schema.sql` (idempotent `CREATE ... IF NOT EXISTS`)
+      3. stop if that file_url is already in `ingest_runs`
+      4. download + parse the workbook (SheetJS)
+      5. build idempotent SQL and apply it with `wrangler d1 execute --file`
                     │
                     ▼
               Cloudflare D1  ──►  Worker read API: /health /snapshots /latest
@@ -188,6 +189,10 @@ npm run dev               # http://127.0.0.1:8787
 
 `DRY_RUN=1` needs network access to regieessencequebec.ca but no Cloudflare credentials.
 
+`npm test` runs `node --test` with no arguments, so Node discovers `test/**/*.test.mjs` itself.
+Passing the bare directory (`node --test test/`) breaks on Node 24: positional arguments are
+resolved as file/glob paths, so a directory is reported as `Cannot find module .../test`.
+
 ## Where the file URL comes from
 
 The map is a Vue single-page app, so the Excel link is not present in the HTML. The site
@@ -213,7 +218,7 @@ back to `generated_at`.
 | `Authentication error [code: 10000]` | `CLOUDFLARE_API_TOKEN` is missing or lacks *D1 Edit* for that account |
 | `Could not read .../stations.geojson.gz (HTTP 404)` | The site moved its data — check the map's network requests |
 | `No metadata.excel_url` | The `metadata` key changed on the site |
-| `D1_ERROR: no such table: station_prices` | `npm run db:schema` was not applied to the remote database |
+| `D1_ERROR: no such table: station_prices` | The ingest workflow applies `schema.sql` on every run; for a manual local run use `npm run db:schema` |
 | Workflow logs "already been ingested" | Expected — the source file has not changed since the last run |
 | Deploy fails on `database_id` | Replace the placeholder in `wrangler.jsonc` with the id from `npx wrangler d1 create` |
 
