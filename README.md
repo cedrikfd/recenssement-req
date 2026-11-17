@@ -72,10 +72,10 @@ Then add the repository secrets used by the scheduled workflow
 | `CLOUDFLARE_API_TOKEN` | *Account → D1 → Edit* and *Account → Workers Scripts → Edit* |
 | `CLOUDFLARE_ACCOUNT_ID` | Your account id (Workers dashboard, right sidebar) |
 
-Push the repository and enable the **Ingest Excel feed** workflow. It runs every 5 minutes, two
-minutes after each publisher tick (`2-57/5 * * * *`), and can also be started manually with
-*Run workflow* — do that once right after the first push, because GitHub can take a while to
-register a new schedule (see *Cadence and quotas → The scheduler is best-effort*).
+Push the repository and enable the **Ingest Excel feed** workflow. It runs every 5 minutes at
+`:01`, `:06`, `:11` … (`1-56/5 * * * *`), and can also be started manually with *Run workflow* —
+do that once right after the first push, because GitHub can take a while to register a new schedule
+(see *Cadence and quotas → The scheduler is best-effort*).
 
 
 ## Data model
@@ -253,7 +253,7 @@ downloaded, so a manual re-run of the workflow costs nothing.
 ### The scheduler is best-effort
 
 GitHub's scheduler is not a real-time clock: runs can be delayed by several minutes, are slower
-right after the top of the hour (that is why the cron is offset to `:02`), and **a newly added
+right after the top of the hour (that is why the cron is offset to `:01`), and **a newly added
 `*/5` schedule can take a surprisingly long time to start at all** — the first scheduled run may be
 tens of minutes late even though the workflow shows `state: active` and the file is valid. If no
 scheduled run appears:
