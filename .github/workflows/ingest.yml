@@ -18,7 +18,7 @@ permissions:
 # Never let two ingests run at once: a queued run is better than two runs
 # racing on the same file.
 concurrency:
-  group: regie-essence-ingest
+  group: ingest
   cancel-in-progress: false
 
 jobs:
@@ -38,7 +38,7 @@ jobs:
       # Tests run on pushes and manual runs only. A scheduled run has to stay
       # short: 288 runs/day are billed as Actions minutes on a private repo.
       - name: Unit tests
-        if: github.event_name != 'schedule'
+        if: github.event_name == 'push'
         run: npm test
 
       # schema.sql only contains CREATE ... IF NOT EXISTS (plus one DROP VIEW /
