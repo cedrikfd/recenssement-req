@@ -6,7 +6,7 @@ name: Ingest Excel feed
 # (measured on consecutive real files: ~8 rows per 5 minutes). A run therefore
 # costs ~20 written rows instead of ~5,000, which keeps the D1 free tier
 # (100,000 written rows/day) comfortable.
-# See README.md -> "Cadence and quotas" before changing the schedule.
+# See README.md -> "Cadence and quotas" before changing the schedule. 
 on:
   schedule:
     # Every 5 minutes, offset one minute from the publisher's tick: :01, :06,
